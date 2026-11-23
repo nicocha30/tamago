@@ -20,9 +20,16 @@ TEXT cpuinit(SB),NOSPLIT|NOFRAME,$0
 	CMP	$1, R0
 	BEQ	init
 
-	// While tamago has been tested in Secure EL3, we drop to Non-secure
-	// EL1 to ease chain loading from TF-A or bootloaders, as on AArch64
-	// the OS is expected to run at this level.
+	// entered at EL2 (e.g. from U-Boot on a TF-A based system)
+	CMP	$2, R0
+	BEQ	el2
+
+	// While tamago has been tested in Secure EL3, we drop to EL1 to ease
+	// chain loading from TF-A or bootloaders, as on AArch64 the OS is
+	// expected to run at this level.
+	//
+	// The EL1 security state is Non-secure by default, Secure with the
+	// `secure_el1` build tag (see scrNS).
 	//
 	// Future tamago unikernels for TF-A replacement or Secure monitors can
 	// branch here to remain in EL3 provided that _EL1 register access is
@@ -36,7 +43,9 @@ TEXT cpuinit(SB),NOSPLIT|NOFRAME,$0
 	ORR	$1<<10, R0	// set lower levels as AArch64
 	ORR	$1<<5, R0	// set reserved bit
 	ORR	$1<<4, R0	// set reserved bit
-	ORR	$1<<0, R0	// set Non-secure state
+	MOVD	·scrNS(SB), R1
+	AND	$1, R1
+	ORR	R1, R0		// set Non-secure state (unless secure_el1)
 	WORD	$0xd51e1100	// msr scr_el3, x0
 
 	// D12.2.44 HCR_EL2, Hypervisor Configuration Register
@@ -52,6 +61,41 @@ TEXT cpuinit(SB),NOSPLIT|NOFRAME,$0
 	// drop to EL1
 	MOVD	$·cpuinit_el1(SB), R0
 	WORD	$0xd51e4020	// msr ELR_EL3, x0
+	ISB	SY
+	ERET
+el2:
+	// Drop from Non-secure EL2 to Non-secure EL1, the hypervisor
+	// configuration is left with all traps disabled.
+
+	// D13.2.48 HCR_EL2, Hypervisor Configuration Register
+	MOVD	$1<<31, R0	// set EL1 level as AArch64
+	WORD	$0xd51c1100	// msr HCR_EL2, x0
+
+	// D13.8.4 CNTHCTL_EL2, Counter-timer Hypervisor Control register
+	MOVD	$0b11, R0	// allow EL1 physical counter and timer access
+	WORD	$0xd51ce100	// msr CNTHCTL_EL2, x0
+
+	// D13.8.33 CNTVOFF_EL2, Counter-timer Virtual Offset register
+	MOVD	$0, R0
+	WORD	$0xd51ce060	// msr CNTVOFF_EL2, x0
+
+	// D13.2.31 CPTR_EL2, Architectural Feature Trap Register (EL2)
+	MOVD	$0x33ff, R0	// set reserved bits, disable FP/SIMD traps
+	WORD	$0xd51c1140	// msr CPTR_EL2, x0
+
+	// D13.2.118 SCTLR_EL1, System Control Register (EL1)
+	MOVD	$0x30d00800, R0	// set reserved bits, MMU and caches off
+	MSR	R0, SCTLR_EL1
+
+	// C5.2.18 SPSR_EL2, Saved Program Status Register (EL2)
+	MOVD	$0, R0
+	ORR	$0b1111<<6, R0	// mask exceptions/interrupts
+	ORR	$0b0101<<0, R0	// set EL1h
+	WORD	$0xd51c4000	// msr SPSR_EL2, x0
+
+	// drop to EL1
+	MOVD	$·cpuinit_el1(SB), R0
+	WORD	$0xd51c4020	// msr ELR_EL2, x0
 	ISB	SY
 	ERET
 init:

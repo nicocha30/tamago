@@ -53,6 +53,12 @@ definition for the `runtime/goos` overlay:
 * `linkramstart`: exclude `ramStart` from `mem.go`
 * `linkcpuinit`: exclude `cpuinit` from `init.s`
 
+The following build tags control the execution state:
+
+* `secure_el1`: when entered at EL3 (e.g. loaded in place of TF-A as BL31),
+  drop to Secure EL1 rather than Non-secure EL1, retaining Secure world
+  access to memory, peripherals and GICv3 Group 0 interrupts
+
 License
 =======
 

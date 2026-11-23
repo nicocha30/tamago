@@ -95,6 +95,12 @@ func (cpu *CPU) initVectorTable() {
 	set_vbar(vectorTable)
 }
 
+// Secure returns whether the unikernel has been built to run in Secure EL1
+// (`secure_el1` build tag) when entered at EL3.
+func (cpu *CPU) Secure() bool {
+	return scrNS == 0
+}
+
 // CurrentEL returns the Current Exception Level.
 func (cpu *CPU) CurrentEL() int {
 	return int(read_el()&0b1100) >> 2

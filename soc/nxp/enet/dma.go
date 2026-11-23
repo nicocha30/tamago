@@ -63,6 +63,8 @@ type bufferDescriptor struct {
 	Addr   uint32
 
 	stats *Stats
+	// data cache maintenance (cacheable data buffers only)
+	cache Cache
 
 	// DMA buffers
 	desc []byte
@@ -86,6 +88,11 @@ func (bd *bufferDescriptor) Read(buf []byte) (n int, err error) {
 		return 0, fmt.Errorf("buffer too small (%d < %d)", len(buf), n)
 	}
 
+	if bd.cache != nil {
+		// discard stale lines before reading what the MAC received
+		bd.cache.InvalidateDataCache(uint(bd.Addr), int(bd.Length))
+	}
+
 	r := n % copyAlign
 	n -= r
 
@@ -107,6 +114,11 @@ func (bd *bufferDescriptor) Write(buf []byte) {
 
 	for i := range r {
 		bd.data[n+i] = buf[n+i]
+	}
+
+	if bd.cache != nil {
+		// write the frame back to memory before the MAC reads it
+		bd.cache.CleanDataCache(uint(bd.Addr), len(buf))
 	}
 }
 
@@ -143,7 +155,7 @@ type bufferDescriptorRing struct {
 	size  int
 }
 
-func (ring *bufferDescriptorRing) init(rx bool, n int, s *Stats) uint32 {
+func (ring *bufferDescriptorRing) init(rx bool, n int, s *Stats, buffers *dma.Region, cache Cache) uint32 {
 	ring.bds = make([]*bufferDescriptor, n)
 	ring.size = n
 
@@ -154,7 +166,18 @@ func (ring *bufferDescriptorRing) init(rx bool, n int, s *Stats) uint32 {
 	ptr, desc := dma.Reserve(n*descSize, bufferAlign)
 
 	dataSize := maxFrameSize + (bufferAlign - (maxFrameSize % bufferAlign))
-	addr, data := dma.Reserve(n*dataSize, bufferAlign)
+
+	if buffers == nil {
+		buffers = dma.Default()
+	}
+
+	// Buffers are aligned to, and sized in multiples of, the cache line
+	// size: cache maintenance on one never affects its neighbors.
+	addr, data := buffers.Reserve(n*dataSize, bufferAlign)
+
+	if cache != nil {
+		cache.InvalidateDataCache(addr, n*dataSize)
+	}
 
 	for i := range n {
 		off := dataSize * i
@@ -163,6 +186,7 @@ func (ring *bufferDescriptorRing) init(rx bool, n int, s *Stats) uint32 {
 			Addr:  uint32(addr) + uint32(off),
 			data:  data[off : off+dataSize],
 			stats: s,
+			cache: cache,
 		}
 
 		if rx {

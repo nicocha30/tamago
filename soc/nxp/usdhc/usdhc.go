@@ -105,6 +105,8 @@ const (
 	SYS_CTRL_DTOCV   = 16
 	SYS_CTRL_SDCLKFS = 8
 	SYS_CTRL_DVS     = 4
+	// Clock enables, reserved on uSDHC with reset value 0b1111
+	SYS_CTRL_CLKEN = 0
 
 	USDHCx_INT_STATUS = 0x30
 	INT_STATUS_DMAE   = 28
@@ -222,6 +224,9 @@ type CardInfo struct {
 	// Capacity
 	Blocks int
 
+	// eMMC boot partition size (in bytes, each)
+	BootSize int
+
 	// device identification number
 	CID [16]byte
 }
@@ -234,11 +239,15 @@ type USDHC struct {
 	Index int
 	// Base register
 	Base uint32
-	// Clock gate register
+	// Clock gate register (optional, see SetClock)
 	CCGR uint32
 	// Clock gate
 	CG int
-	// Clock setup function
+	// Clock setup function, the root clock frequency is selected as
+	// 396 MHz / (podf + 1) (or the closest SoC specific value).
+	//
+	// When CCGR is not set, it is also invoked on [USDHC.Init] with
+	// ROOTCLK_HS_SDR to set the default root clock and enable it.
 	SetClock func(index int, podf uint32, clksel uint32) error
 
 	// LowVoltage is the board specific function responsible for voltage
@@ -280,6 +289,8 @@ type USDHC struct {
 	rpmb bool
 	// eMMC RPMB reliable write request
 	rel bool
+	// eMMC partition configuration (EXT_CSD PARTITION_CONFIG)
+	partConfig uint32
 
 	readTimeout  time.Duration
 	writeTimeout time.Duration
@@ -296,6 +307,11 @@ func (hw *USDHC) setFreq(dvs int, sdclkfs int) {
 	if dvs < 0 && sdclkfs < 0 {
 		return
 	}
+
+	// Retain the reserved clock enable bits at their reset value, as also
+	// done by Linux, as emulated controllers (e.g. QEMU) might otherwise
+	// never report a stable clock.
+	reg.SetN(hw.sys_ctrl, SYS_CTRL_CLKEN, 0xf, 0xf)
 
 	// Wait for stable clock as noted in
 	// p4038, DVS[3:0], IMX6ULLRM.
@@ -366,7 +382,7 @@ func (hw *USDHC) Init(width int) {
 	hw.Lock()
 	defer hw.Unlock()
 
-	if hw.Index == 0 || hw.Base == 0 || hw.SetClock == nil || hw.CCGR == 0 {
+	if hw.Index == 0 || hw.Base == 0 || hw.SetClock == nil {
 		panic("invalid uSDHC controller instance")
 	}
 
@@ -398,8 +414,12 @@ func (hw *USDHC) Init(width int) {
 	// p106, 4.6.2.2 Write, SD-PL-7.10
 	hw.writeTimeout = 500 * time.Millisecond
 
-	// enable clock
-	reg.SetN(hw.CCGR, hw.CG, 0b11, 0b11)
+	if hw.CCGR != 0 {
+		// enable clock
+		reg.SetN(hw.CCGR, hw.CG, 0b11, 0b11)
+	} else if err := hw.SetClock(hw.Index, ROOTCLK_HS_SDR, 0); err != nil {
+		panic("could not set uSDHC clock, " + err.Error())
+	}
 }
 
 // Detect initializes an SD/MMC card. The highest speed supported by the

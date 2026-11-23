@@ -149,7 +149,10 @@ func (hw *USDHC) voltageValidationSD() bool {
 	var arg uint32
 	var hv bool
 
-	// ensure 3.3V signaling
+	// ensure 3.3V signaling, previous boot stages might have left the
+	// SoC uSDHC IO power voltage selection signal at 1.8V (UHS-I)
+	reg.Clear(hw.vend_spec, VEND_SPEC_VSELECT)
+
 	if hw.LowVoltage != nil {
 		hw.LowVoltage(false)
 	}
@@ -219,9 +222,9 @@ func (hw *USDHC) voltageValidationSD() bool {
 			continue
 		}
 
-		if bits.GetN(&rsp, SD_OCR_HCS, 1) == 1 {
-			hw.card.HC = true
-		}
+		// Card Capacity Status (CCS): standard capacity cards (SDSC)
+		// use byte addressing even when they support CMD8.
+		hw.card.HC = bits.GetN(&rsp, SD_OCR_HCS, 1) == 1
 
 		// Select the fastest mandatory speed mode, supported by this
 		// driver, according to the card type.
@@ -261,8 +264,8 @@ func (hw *USDHC) detectCapabilitiesSD() (err error) {
 		read_bl_len := hw.rspVal(SD_CSD_READ_BL_LEN_1, 0xf)
 
 		// p205, C_SIZE, SD-PL-7.10
-		hw.card.BlockSize = 2 << (read_bl_len - 1)
-		hw.card.Blocks = int((c_size + 1) * (2 << (c_size_mult + 2)))
+		hw.card.BlockSize = 512
+		hw.card.Blocks = csdBlocks(c_size, c_size_mult, read_bl_len, hw.card.BlockSize)
 	case 1:
 		// CSD Version 2.0
 		c_size := hw.rspVal(SD_CSD_C_SIZE_2, 0x3fffff)
@@ -445,4 +448,15 @@ func (hw *USDHC) initSD() (err error) {
 	hw.card.HS = true
 
 	return
+}
+
+// csdBlocks returns the number of blocks of the argument size for byte
+// addressed (standard capacity) cards, as described by CSD version 1.0
+// fields: (C_SIZE + 1) * 2^(C_SIZE_MULT + 2) * 2^READ_BL_LEN bytes.
+//
+// As data transfers use 512 bytes blocks, also on cards with a larger
+// READ_BL_LEN, the capacity is expressed in such units.
+func csdBlocks(cSize uint32, cSizeMult uint32, readBlLen uint32, blockSize int) int {
+	capacity := uint64(cSize+1) << (cSizeMult + 2) << readBlLen
+	return int(capacity / uint64(blockSize))
 }

@@ -51,6 +51,7 @@ const (
 	TRAN_SPEED_26MHZ = 0x32
 
 	// p193, 7.4 Extended CSD register, JESD84-B51
+	EXT_CSD_BOOT_SIZE_MULT   = 226
 	EXT_CSD_SEC_COUNT        = 212
 	EXT_CSD_DEVICE_TYPE      = 196
 	EXT_CSD_HS_TIMING        = 185
@@ -58,8 +59,14 @@ const (
 	EXT_CSD_PARTITION_CONFIG = 179
 
 	// p224, PARTITION_CONFIG, JESD84-B51
-	PARTITION_ACCESS_NONE = 0x0
-	PARTITION_ACCESS_RPMB = 0x3
+	PARTITION_ACCESS_NONE  = 0x0
+	PARTITION_ACCESS_BOOT1 = 0x1 // first boot partition (e.g. mmcblkXboot0 on Linux)
+	PARTITION_ACCESS_BOOT2 = 0x2 // second boot partition (e.g. mmcblkXboot1 on Linux)
+	PARTITION_ACCESS_RPMB  = 0x3
+	PARTITION_ACCESS_MASK  = 0b111
+
+	// p223, BOOT_SIZE_MULT, JESD84-B51
+	BOOT_SIZE_UNIT = 128 * 1024
 
 	// p222, 7.4.65 HS_TIMING [185], JESD84-B51
 	HS_TIMING_HS    = 0x1
@@ -180,8 +187,23 @@ func (hw *USDHC) detectCapabilitiesMMC(c_size_mult uint32, c_size uint32, read_b
 		hw.card.Blocks = int(binary.LittleEndian.Uint32(extCSD[EXT_CSD_SEC_COUNT:]))
 	} else {
 		// p188, 7.3.12 C_SIZE [73:62], JESD84-B51
-		hw.card.BlockSize = 2 << (read_bl_len - 1)
-		hw.card.Blocks = int((c_size + 1) * (2 << (c_size_mult + 2)))
+		// p187, C_SIZE, JESD84-B51
+		hw.card.BlockSize = MMC_DEFAULT_BLOCK_SIZE
+		hw.card.Blocks = csdBlocks(c_size, c_size_mult, read_bl_len, MMC_DEFAULT_BLOCK_SIZE)
+	}
+
+	// boot partitions size
+	hw.card.BootSize = int(extCSD[EXT_CSD_BOOT_SIZE_MULT]) * BOOT_SIZE_UNIT
+	// current partition configuration (boot settings are preserved on
+	// partition switches)
+	hw.partConfig = uint32(extCSD[EXT_CSD_PARTITION_CONFIG])
+
+	// ensure user area access, which might have been left otherwise by
+	// previous boot stages
+	if hw.partConfig&PARTITION_ACCESS_MASK != PARTITION_ACCESS_NONE {
+		if err = hw.partitionAccessMMC(PARTITION_ACCESS_NONE); err != nil {
+			return
+		}
 	}
 
 	// p220, Table 137 — Device types, JESD84-B51
@@ -252,7 +274,7 @@ func (hw *USDHC) initMMC() (err error) {
 	// e•MMC specification version
 	ver := hw.rspVal(MMC_CSD_SPEC_VERS, 0xf)
 
-	if mhz == TRAN_SPEED_26MHZ {
+	if tranSpeedKHz(mhz) >= tranSpeedKHz(TRAN_SPEED_26MHZ) {
 		// clear clock
 		hw.setFreq(-1, -1)
 		// set operating frequency
@@ -353,7 +375,75 @@ func (hw *USDHC) initMMC() (err error) {
 
 // p224, 7.4.69 PARTITION_CONFIG [179], JESD84-B51
 func (hw *USDHC) partitionAccessMMC(access uint32) (err error) {
-	return hw.writeCardRegisterMMC(EXT_CSD_PARTITION_CONFIG, access)
+	// Preserve BOOT_ACK and BOOT_PARTITION_ENABLE, which select the boot
+	// partition used by the SoC boot ROM (e.g. i.MX93 eMMC boot).
+	val := hw.partConfig&^PARTITION_ACCESS_MASK | access&PARTITION_ACCESS_MASK
+
+	if err = hw.writeCardRegisterMMC(EXT_CSD_PARTITION_CONFIG, val); err == nil {
+		hw.partConfig = val
+	}
+
+	return
+}
+
+func (hw *USDHC) transferPartition(index uint32, dtd uint32, part uint32, lba int, buf []byte) (err error) {
+	blockSize := hw.card.BlockSize
+	size := len(buf)
+
+	if !hw.card.MMC {
+		return fmt.Errorf("no MMC card detected on uSDHC%d", hw.Index)
+	}
+
+	switch part {
+	case PARTITION_ACCESS_NONE:
+		return hw.transferBlocks(index, dtd, lba, buf)
+	case PARTITION_ACCESS_BOOT1, PARTITION_ACCESS_BOOT2:
+	default:
+		return errors.New("invalid partition")
+	}
+
+	if size == 0 || blockSize == 0 {
+		return
+	}
+
+	if size%blockSize != 0 {
+		return fmt.Errorf("transfer size must be %d bytes aligned", blockSize)
+	}
+
+	if lba < 0 || (lba*blockSize)+size > hw.card.BootSize {
+		return errors.New("transfer exceeds boot partition size")
+	}
+
+	hw.Lock()
+	defer hw.Unlock()
+
+	if err = hw.partitionAccessMMC(part); err != nil {
+		return
+	}
+
+	defer func() {
+		if e := hw.partitionAccessMMC(PARTITION_ACCESS_NONE); err == nil {
+			err = e
+		}
+	}()
+
+	return hw.transfer(index, dtd, uint64(lba)*uint64(blockSize), uint32(size/blockSize), uint32(blockSize), buf)
+}
+
+// WritePartitionBlocks transfers full blocks of data to an eMMC hardware
+// partition (e.g. [PARTITION_ACCESS_BOOT2]), the boot configuration is
+// preserved and the user area is selected again on completion.
+func (hw *USDHC) WritePartitionBlocks(part uint32, lba int, buf []byte) (err error) {
+	// CMD25 - WRITE_MULTIPLE_BLOCK - write consecutive blocks
+	return hw.transferPartition(25, WRITE, part, lba, buf)
+}
+
+// ReadPartitionBlocks transfers full blocks of data from an eMMC hardware
+// partition (e.g. [PARTITION_ACCESS_BOOT2]), the user area is selected again
+// on completion.
+func (hw *USDHC) ReadPartitionBlocks(part uint32, lba int, buf []byte) (err error) {
+	// CMD18 - READ_MULTIPLE_BLOCK - read consecutive blocks
+	return hw.transferPartition(18, READ, part, lba, buf)
 }
 
 // p106, 6.6.22.4.3 Authenticated Data Write, JESD84-B51
@@ -403,4 +493,21 @@ func (hw *USDHC) WriteRPMB(buf []byte, rel bool) (err error) {
 // frame from the card.
 func (hw *USDHC) ReadRPMB(buf []byte) (err error) {
 	return hw.transferRPMB(READ, buf, false)
+}
+
+// tranSpeedKHz decodes the CSD TRAN_SPEED field
+// (p186, TRAN_SPEED [103:96], JESD84-B51).
+func tranSpeedKHz(tranSpeed uint32) uint32 {
+	// frequency unit in KHz (100 KHz, 1 MHz, 10 MHz, 100 MHz)
+	units := []uint32{100, 1000, 10000, 100000}
+	// multiplier factors (x10)
+	mult := []uint32{0, 10, 12, 13, 15, 20, 26, 30, 35, 40, 45, 52, 55, 60, 70, 80}
+
+	unit := tranSpeed & 0b111
+
+	if unit >= uint32(len(units)) {
+		return 0
+	}
+
+	return units[unit] * mult[(tranSpeed>>3)&0xf] / 10
 }

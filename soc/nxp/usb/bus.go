@@ -132,17 +132,18 @@ type USB struct {
 	Index int
 	// Base register
 	Base uint32
-	// Clock gate register
+	// Clock gate register (optional when EnablePLL handles clocking)
 	CCGR uint32
 	// Clock gate
 	CG int
-	// Analog base register
+	// Analog base register (optional, i.MX6 charger detection)
 	Analog uint32
-	// PHY base register
+	// PHY base register (optional, i.MX6 USBPHY, not required for
+	// integrated PHYs initialized by EnablePLL)
 	PHY uint32
 	// Interrupt ID (placeholder for caller use)
 	IRQ int
-	// PLL enable function
+	// PLL, clock and PHY enable function
 	EnablePLL func(index int) error
 
 	// USB device configuration
@@ -185,13 +186,10 @@ func (hw *USB) Init() {
 	hw.Lock()
 	defer hw.Unlock()
 
-	if hw.Base == 0 || hw.CCGR == 0 || hw.Analog == 0 || hw.PHY == 0 || hw.EnablePLL == nil {
+	if hw.Base == 0 || hw.EnablePLL == nil {
 		panic("invalid USB controller instance")
 	}
 
-	hw.ctrl = hw.PHY + USBPHYx_CTRL
-	hw.pwd = hw.PHY + USBPHYx_PWD
-	hw.chrg = hw.Analog + USB_ANALOG_USBx_CHRG_DETECT
 	hw.mode = hw.Base + USB_UOGx_USBMODE
 	hw.otg = hw.Base + USB_UOGx_OTGSC
 	hw.cmd = hw.Base + USB_UOGx_USBCMD
@@ -207,29 +205,43 @@ func (hw *USB) Init() {
 	hw.complete = hw.Base + USB_UOGx_ENDPTCOMPLETE
 	hw.epctrl = hw.Base + USB_UOGx_ENDPTCTRL
 
-	// enable clock
-	reg.SetN(hw.CCGR, hw.CG, 0b11, 0b11)
-	hw.EnablePLL(hw.Index)
+	if hw.CCGR != 0 {
+		// enable clock
+		reg.SetN(hw.CCGR, hw.CG, 0b11, 0b11)
+	}
 
-	// soft reset USB PHY
-	reg.Set(hw.ctrl, CTRL_SFTRST)
-	reg.Clear(hw.ctrl, CTRL_SFTRST)
+	if err := hw.EnablePLL(hw.Index); err != nil {
+		panic("could not enable USB clocks, " + err.Error())
+	}
 
-	// disable clock gate
-	reg.Clear(hw.ctrl, CTRL_CLKGATE)
+	if hw.PHY != 0 {
+		hw.ctrl = hw.PHY + USBPHYx_CTRL
+		hw.pwd = hw.PHY + USBPHYx_PWD
 
-	// clear power down
-	reg.Write(hw.pwd, 0)
+		// soft reset USB PHY
+		reg.Set(hw.ctrl, CTRL_SFTRST)
+		reg.Clear(hw.ctrl, CTRL_SFTRST)
 
-	// enable UTMI+
-	reg.Set(hw.ctrl, CTRL_ENUTMILEVEL3)
-	reg.Set(hw.ctrl, CTRL_ENUTMILEVEL2)
-	// enable disconnection detect
-	reg.Set(hw.ctrl, CTRL_ENHOSTDISCONDETECT)
+		// disable clock gate
+		reg.Clear(hw.ctrl, CTRL_CLKGATE)
 
-	// disable charger detector
-	reg.Set(hw.chrg, CHRG_DETECT_EN_B)
-	reg.Set(hw.chrg, CHRG_DETECT_CHK_CHRG_B)
+		// clear power down
+		reg.Write(hw.pwd, 0)
+
+		// enable UTMI+
+		reg.Set(hw.ctrl, CTRL_ENUTMILEVEL3)
+		reg.Set(hw.ctrl, CTRL_ENUTMILEVEL2)
+		// enable disconnection detect
+		reg.Set(hw.ctrl, CTRL_ENHOSTDISCONDETECT)
+	}
+
+	if hw.Analog != 0 {
+		hw.chrg = hw.Analog + USB_ANALOG_USBx_CHRG_DETECT
+
+		// disable charger detector
+		reg.Set(hw.chrg, CHRG_DETECT_EN_B)
+		reg.Set(hw.chrg, CHRG_DETECT_CHK_CHRG_B)
+	}
 }
 
 // Speed returns the port speed.
@@ -253,7 +265,9 @@ func (hw *USB) Speed() (speed string) {
 
 // PowerDown shuts down the USB PHY.
 func (hw *USB) PowerDown() {
-	reg.Write(hw.pwd, 0xffffffff)
+	if hw.pwd != 0 {
+		reg.Write(hw.pwd, 0xffffffff)
+	}
 }
 
 // Run sets the controller in run mode.

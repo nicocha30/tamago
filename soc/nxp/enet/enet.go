@@ -9,6 +9,7 @@
 // Package enet implements a driver for NXP Ethernet controllers adopting the
 // following reference specifications:
 //   - IMX6ULLRM - i.MX 6ULL Applications Processor Reference Manual - Rev 1 2017/11
+//   - IMX93RM   - i.MX 93 Applications Processor Reference Manual - Rev 4 2023/12
 //
 // This package is only meant to be used with `GOOS=tamago` as supported by the
 // TamaGo framework for bare metal Go, see https://github.com/usbarmory/tamago.
@@ -22,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/usbarmory/tamago/dma"
 	"github.com/usbarmory/tamago/internal/reg"
 )
 
@@ -40,7 +42,8 @@ const (
 
 	ENETx_ECR   = 0x0024
 	ECR_DBSWP   = 8
-	ECR_EN1588  = 5
+	ECR_SPEED   = 5
+	ECR_EN1588  = 4
 	ECR_ETHEREN = 1
 	ECR_RESET   = 0
 
@@ -55,13 +58,18 @@ const (
 
 	ENETx_RCR     = 0x0084
 	RCR_MAX_FL    = 16
+	RCR_RMII_10T  = 9
 	RCR_RMII_MODE = 8
+	RCR_RGMII_EN  = 6
 	RCR_FCE       = 5
 	RCR_MII_MODE  = 2
 	RCR_LOOP      = 0
 
 	ENETx_TCR = 0x00c4
 	TCR_FDEN  = 2
+
+	ENETx_TFWR  = 0x0144
+	TFWR_STRFWD = 8
 
 	ENETx_PALR = 0x00e4
 	ENETx_PAUR = 0x00e8
@@ -108,6 +116,13 @@ type Stats struct {
 	FrameTooLarge        uint32
 }
 
+// Cache represents the CPU data cache maintenance operations required when
+// frame buffers are allocated in cacheable memory (see [ENET.Buffers]).
+type Cache interface {
+	CleanDataCache(addr uint, size int)
+	InvalidateDataCache(addr uint, size int)
+}
+
 // ENET represents an Ethernet MAC instance.
 type ENET struct {
 	sync.Mutex
@@ -116,7 +131,7 @@ type ENET struct {
 	Index int
 	// Base register
 	Base uint32
-	// Clock gate register
+	// Clock gate register (optional when EnablePLL handles clocking)
 	CCGR uint32
 	// Clock gate
 	CG int
@@ -130,10 +145,22 @@ type ENET struct {
 	EnablePHY func(eth *ENET) error
 	// RMII mode
 	RMII bool
+	// RGMII mode (Gigabit capable controllers only)
+	RGMII bool
 	// MAC address (use SetMAC() for post Init() changes)
 	MAC net.HardwareAddr
 	// Descriptor ring size
 	RingSize int
+
+	// DMA region for frame data buffers, the global one is used when
+	// unset. Buffer descriptors are always allocated in the global region.
+	//
+	// A dedicated region allows frame buffers to live in cacheable memory
+	// while descriptors remain in device (uncached) memory, in which case
+	// Cache must be set.
+	Buffers *dma.Region
+	// Data cache maintenance, required when Buffers is cacheable memory
+	Cache Cache
 
 	// Discard MAC layer errors
 	DiscardErrors bool
@@ -154,6 +181,7 @@ type ENET struct {
 	mib  uint32
 	rcr  uint32
 	tcr  uint32
+	tfwr uint32
 	palr uint32
 	paur uint32
 	rdsr uint32
@@ -169,7 +197,8 @@ type ENET struct {
 }
 
 // Init initializes and enables the Ethernet MAC controller for 100 Mbps full
-// duplex operation with Auto-Negotiation enabled.
+// duplex operation with Auto-Negotiation enabled, the speed can be adjusted
+// with [ENET.SetSpeed] (e.g. within [ENET.EnablePHY]).
 func (hw *ENET) Init() (err error) {
 	hw.Lock()
 	defer hw.Unlock()
@@ -206,6 +235,7 @@ func (hw *ENET) Init() (err error) {
 	hw.mib = hw.Base + ENETx_MIB
 	hw.rcr = hw.Base + ENETx_RCR
 	hw.tcr = hw.Base + ENETx_TCR
+	hw.tfwr = hw.Base + ENETx_TFWR
 	hw.palr = hw.Base + ENETx_PALR
 	hw.paur = hw.Base + ENETx_PAUR
 	hw.rdsr = hw.Base + ENETx_RDSR
@@ -218,11 +248,15 @@ func (hw *ENET) Init() (err error) {
 }
 
 func (hw *ENET) setup() (err error) {
-	// enable clock
-	reg.SetN(hw.CCGR, hw.CG, 0b11, 0b11)
+	if hw.CCGR != 0 {
+		// enable clock
+		reg.SetN(hw.CCGR, hw.CG, 0b11, 0b11)
+	}
 
 	if hw.EnablePLL != nil {
-		hw.EnablePLL(hw.Index)
+		if err = hw.EnablePLL(hw.Index); err != nil {
+			return
+		}
 	}
 
 	// soft reset
@@ -244,9 +278,7 @@ func (hw *ENET) setup() (err error) {
 	reg.Clear(hw.ecr, ECR_EN1588)
 
 	// set receive buffer size and maximum frame length
-	size := maxFrameSize + (bufferAlign - (maxFrameSize % bufferAlign))
-	reg.Write(hw.mrbr, uint32(size))
-	reg.Write(hw.ftrl, maxFrameSize)
+	hw.setBufferSize()
 	reg.SetN(hw.rcr, RCR_MAX_FL, 0x3fff, maxFrameSize)
 
 	if hw.DiscardErrors {
@@ -259,6 +291,15 @@ func (hw *ENET) setup() (err error) {
 	// set Media Independent Interface Mode
 	reg.Set(hw.rcr, RCR_MII_MODE)
 	reg.SetTo(hw.rcr, RCR_RMII_MODE, hw.RMII)
+	reg.SetTo(hw.rcr, RCR_RGMII_EN, hw.RGMII)
+	// default to 100 Mbps
+	reg.Clear(hw.rcr, RCR_RMII_10T)
+	reg.Clear(hw.ecr, ECR_SPEED)
+
+	if hw.RGMII {
+		// Gigabit operation requires transmit store and forward
+		reg.Write(hw.tfwr, 1<<TFWR_STRFWD)
+	}
 	// enable Flow Control
 	reg.Set(hw.rcr, RCR_FCE)
 	// disable loopback
@@ -266,7 +307,7 @@ func (hw *ENET) setup() (err error) {
 
 	// set MII clock
 	reg.SetN(hw.mscr, MSCR_HOLDTIME, 0b111, 1)
-	reg.SetN(hw.mscr, MSCR_MII_SPEED, 0x3f, hw.Clock()/(2*2500000))
+	reg.SetN(hw.mscr, MSCR_MII_SPEED, 0x3f, min(hw.Clock()/(2*2500000), 0x3f))
 
 	// enable Ethernet MAC
 	reg.Set(hw.ecr, ECR_ETHEREN)
@@ -274,6 +315,34 @@ func (hw *ENET) setup() (err error) {
 	if hw.EnablePHY != nil {
 		// enable Ethernet PHY
 		err = hw.EnablePHY(hw)
+	}
+
+	return
+}
+
+// SetSpeed configures the MAC for the argument link speed (10, 100 or 1000
+// Mbps), which must match the one negotiated by the PHY. It is meant to be
+// invoked within [ENET.EnablePHY] or before [ENET.Start], as it resets the
+// controller descriptor processing.
+func (hw *ENET) SetSpeed(speed int) (err error) {
+	switch speed {
+	case 10, 100:
+	case 1000:
+		if !hw.RGMII {
+			return errors.New("1000 Mbps requires RGMII mode")
+		}
+	default:
+		return errors.New("invalid speed")
+	}
+
+	enabled := reg.Get(hw.ecr, ECR_ETHEREN)
+	reg.Clear(hw.ecr, ECR_ETHEREN)
+
+	reg.SetTo(hw.ecr, ECR_SPEED, speed == 1000)
+	reg.SetTo(hw.rcr, RCR_RMII_10T, speed == 10)
+
+	if enabled {
+		reg.Set(hw.ecr, ECR_ETHEREN)
 	}
 
 	return
@@ -291,12 +360,27 @@ func (hw *ENET) SetMAC(mac net.HardwareAddr) {
 	reg.Write(hw.paur, uint32(upper)<<16)
 }
 
+// setBufferSize sets the receive buffer size and frame truncation length.
+func (hw *ENET) setBufferSize() {
+	size := maxFrameSize + (bufferAlign - (maxFrameSize % bufferAlign))
+	reg.Write(hw.mrbr, uint32(size))
+	reg.Write(hw.ftrl, maxFrameSize)
+}
+
 // Start begins processing of incoming packets.
 func (hw *ENET) Start() {
-	// set receive and transmit descriptors
-	reg.Write(hw.rdsr, hw.rx.init(true, hw.RingSize, &hw.Stats))
-	reg.Write(hw.tdsr, hw.tx.init(false, hw.RingSize, &hw.Stats))
+	// The descriptor ring start addresses are latched when the controller
+	// is enabled (e.g. on i.MX93), therefore they are set with the
+	// controller disabled, as done by Linux.
+	reg.Clear(hw.ecr, ECR_ETHEREN)
 
+	// set receive and transmit descriptors, along with the receive buffer
+	// size, as done by Linux (FEC_R_DES_START and FEC_R_BUFF_SIZE)
+	reg.Write(hw.rdsr, hw.rx.init(true, hw.RingSize, &hw.Stats, hw.Buffers, hw.Cache))
+	reg.Write(hw.tdsr, hw.tx.init(false, hw.RingSize, &hw.Stats, hw.Buffers, hw.Cache))
+	hw.setBufferSize()
+
+	reg.Set(hw.ecr, ECR_ETHEREN)
 	reg.Set(hw.rdar, RDAR_ACTIVE)
 }
 

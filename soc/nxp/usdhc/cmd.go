@@ -164,6 +164,11 @@ func (hw *USDHC) cmd(index uint32, arg uint32, blocks uint32, timeout time.Durat
 	xfr := reg.Read(hw.cmd_xfr)
 	mix := reg.Read(hw.mix_ctrl)
 
+	// Clear reserved bits (transfer mode on standard SDHCI controllers,
+	// relocated to MIX_CTRL on uSDHC), as also done by Linux, as emulated
+	// controllers (e.g. QEMU) might otherwise merge stale values.
+	bits.SetN(&xfr, 0, 0xffff, 0)
+
 	// set command index
 	bits.SetN(&xfr, CMD_XFR_TYP_CMDINX, 0b111111, index)
 	// clear special command types
@@ -185,12 +190,17 @@ func (hw *USDHC) cmd(index uint32, arg uint32, blocks uint32, timeout time.Durat
 		bits.Set(&xfr, CMD_XFR_TYP_DPSEL)
 		// enable DMA
 		bits.Set(&mix, MIX_CTRL_DMAEN)
-		// enable automatic CMD12 to stop transactions
-		bits.Set(&mix, MIX_CTRL_AC12EN)
+		// CMD18 - READ_MULTIPLE_BLOCK, CMD25 - WRITE_MULTIPLE_BLOCK
+		multi := index == 18 || index == 25
+
+		// Enable automatic CMD12 to stop multiple block commands only, as
+		// on some controllers (e.g. i.MX93) it is otherwise also issued
+		// after single block data commands (e.g. CMD6 switch function).
+		bits.SetTo(&mix, MIX_CTRL_AC12EN, multi && !hw.rpmb)
 		// multiple blocks
-		bits.SetTo(&mix, MIX_CTRL_MSBSEL, blocks > 1)
+		bits.SetTo(&mix, MIX_CTRL_MSBSEL, multi || blocks > 1)
 		// block count
-		bits.SetTo(&mix, MIX_CTRL_BCEN, blocks > 1)
+		bits.SetTo(&mix, MIX_CTRL_BCEN, multi || blocks > 1)
 	} else {
 		bits.Clear(&xfr, CMD_XFR_TYP_DPSEL)
 		bits.Clear(&mix, MIX_CTRL_AC12EN)
