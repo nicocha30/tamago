@@ -121,8 +121,12 @@ RTL8211F PHY:
 
 | Connector  | Controller                | Board variable    | PHY address | PHY reset  |
 |------------|---------------------------|-------------------|-------------|------------|
-| `ETH1`     | ENET_QOS (`soc/nxp/eqos`) | `modelc.ENET_QOS` | 1           | GPIO3_IO26 |
-| `ETH2`     | FEC (`soc/nxp/enet`)      | `modelc.ENET1`    | 2           | GPIO3_IO27 |
+| `ETH1`     | FEC (`soc/nxp/enet`)      | `modelc.ENET1`    | 2           | GPIO3_IO27 |
+| `ETH2`     | ENET_QOS (`soc/nxp/eqos`) | `modelc.ENET_QOS` | 1           | GPIO3_IO26 |
+
+Both controllers default to the MAC address assigned to the board in the OTP
+fuses (`imx93.MAC(1)` for `ENET1`, `imx93.MAC(2)` for `ENET_QOS`), a random
+one is used when the fuses are not programmed.
 
 Their initialization configures pads, clocks and the PHY, then waits for
 link establishment (`modelc.LinkTimeout`, 5 seconds by default) to set the

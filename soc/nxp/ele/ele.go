@@ -51,6 +51,7 @@ const (
 
 	STATUS_SUCCESS = 0xd6
 
+	CMD_GET_EVENTS = 0xa2
 	CMD_START_RNG  = 0xa3
 	CMD_TRNG_STATE = 0xa4
 	CMD_RNG_GET    = 0xcd
@@ -323,6 +324,32 @@ func (hw *ELE) GetInfo() (info *Info, err error) {
 	copy(info.UID[:], buf[12:28])
 
 	return
+}
+
+// GetEvents returns the ELE event log, which records the errors encountered
+// since the last reset (e.g. boot container authentication failures, which
+// are not fatal while the lifecycle is not closed).
+//
+// Each event encodes, from the most significant byte: the command, the
+// failure indication, the abort code and the status.
+func (hw *ELE) GetEvents() (events []uint32, err error) {
+	rsp, err := hw.Call(VERSION_BASELINE, CMD_GET_EVENTS)
+
+	if err != nil {
+		return
+	}
+
+	if len(rsp) < 2 {
+		return nil, errors.New("invalid ELE events response")
+	}
+
+	n := int(rsp[1] & 0xffff)
+
+	if n > len(rsp)-2 {
+		n = len(rsp) - 2
+	}
+
+	return append(events, rsp[2:2+n]...), nil
 }
 
 // StartRNG requests the initialization of the ELE TRNG.

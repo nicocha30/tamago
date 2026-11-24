@@ -52,6 +52,17 @@ TEXT cpuinit(SB),NOSPLIT|NOFRAME,$0
 	MOVD	$1<<31, R0	// set EL1 level as AArch64
 	WORD	$0xd51c1100	// msr HCR_EL2, x0
 
+	// D12.2.30 CPTR_EL3, Architectural Feature Trap Register (EL3)
+	MOVD	$0, R0		// disable FP/SIMD and CPACR_EL1 traps
+	WORD	$0xd51e1140	// msr CPTR_EL3, x0
+
+	// D12.2.100 SCTLR_EL1, System Control Register (EL1)
+	//
+	// The register is in an UNKNOWN state when EL1 has never been
+	// entered (e.g. when started in place of TF-A).
+	MOVD	$0x30d00800, R0	// set reserved bits, MMU and caches off
+	MSR	R0, SCTLR_EL1
+
 	// C5.2.19 SPSR_EL3, Saved Program Status Register (EL3)
 	MOVD	$0, R0
 	ORR	$0b1111<<6, R0	// mask exceptions/interrupts

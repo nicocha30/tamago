@@ -25,8 +25,8 @@ import (
 // On the DEBIX Model C both Ethernet ports are connected in RGMII mode to
 // Realtek RTL8211F PHYs (other PHYs are handled through standard registers):
 //
-//   - ETH1 connector: ENET_QOS, PHY address 1, reset on GPIO3_IO26
-//   - ETH2 connector: FEC (i.MX93 ENET1), PHY address 2, reset on GPIO3_IO27
+//   - ETH2 connector: ENET_QOS, PHY address 1, reset on GPIO3_IO26
+//   - ETH1 connector: FEC (i.MX93 ENET1), PHY address 2, reset on GPIO3_IO27
 const (
 	ENET1_PHY_ADDR       = 2
 	ENET1_PHY_RESET_GPIO = 27 // GPIO3_IO27
@@ -103,6 +103,16 @@ func init() {
 
 	imx93.ENET_QOS.ResetPHY = ResetENETQOSPHY
 	imx93.ENET_QOS.EnablePHY = EnableENETQOSPHY
+
+	// Default to the addresses assigned to the board (OTP fuses), when
+	// not programmed the drivers pick a random one.
+	if mac, err := imx93.MAC(1); err == nil {
+		imx93.ENET1.MAC = mac
+	}
+
+	if mac, err := imx93.MAC(2); err == nil {
+		imx93.ENET_QOS.MAC = mac
+	}
 }
 
 func configureRGMIIPads(mux uint32, ctl uint32) {
